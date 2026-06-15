@@ -44,7 +44,7 @@ class NJUCMPlatform(BasePlatform):
         "tabletennis": "1881596027069288449",
     }
 
-    # 场地号 → placeAreaId (从 API 动态获取，这是静态缓存)
+    # 场地号 → placeAreaId
     AREA_NAME_MAP: dict[int, str] = {
         1: "1881606335821271041",
         2: "1881606382399016961",
@@ -54,6 +54,13 @@ class NJUCMPlatform(BasePlatform):
         6: "1881606534392205313",
         7: "1881606572421959681",
         8: "1881606600058228738",
+        9: "1881606634262777857",
+        10: "1881606673185918977",
+        11: "1881606702785122306",
+        12: "1881606738377986049",
+        13: "1881606770770595842",
+        14: "1881606797656084481",
+        15: "1881606822591221762",
     }
 
     # 营业规则 (从 API rules 中获取: startTime=08:30, endTime=21:30, unit=60)
@@ -350,7 +357,7 @@ class NJUCMPlatform(BasePlatform):
 
             # 从场地名提取编号 (如 "1号场地" → 1)
             area_num = 0
-            for i in range(1, 9):
+            for i in range(1, 16):
                 if f"{i}号" in area_name:
                     area_num = i
                     break
