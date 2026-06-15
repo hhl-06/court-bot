@@ -84,18 +84,43 @@ def run(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Fetch slots but don't submit booking",
     ),
+    date: Optional[str] = typer.Option(
+        None, "--date", "-d",
+        help="Target date (YYYY-MM-DD). Overrides date_offset in config.",
+    ),
+    times: Optional[str] = typer.Option(
+        None, "--times", "-t",
+        help='Preferred time slots, comma-separated. E.g. "18:30-20:30,19:30-20:30"',
+    ),
+    courts: Optional[str] = typer.Option(
+        None, "--courts", "-n",
+        help='Preferred court numbers, comma-separated. E.g. "6,7,8,9,10"',
+    ),
 ):
     """
     Start the booking scheduler.
 
-    By default, waits until the configured open_time and then fires booking requests.
-    Use --now to book immediately. Use --dry-run for a test run.
+    Examples:
+        court-bot run                                    # Use config defaults
+        court-bot run --date 2026-06-20 --times "18:30-20:30" --courts "6,7,8"
+        court-bot run --now --dry-run                    # Test immediately
     """
     _print_banner()
 
     config = _load_or_exit(ctx)
     if dry_run:
         config.advanced.dry_run = True
+
+    # ── CLI overrides ───────────────────────────────────
+    if times:
+        config.booking.preferred_times = [t.strip() for t in times.split(",")]
+    if courts:
+        config.booking.preferred_courts = [int(n.strip()) for n in courts.split(",")]
+    if date:
+        from datetime import date as dt, timedelta
+        target = dt.fromisoformat(date)
+        offset = (target - dt.today()).days
+        config.booking.date_offset = max(0, offset)
 
     platform_cls = _get_platform_or_exit(config.platform)
     platform = platform_cls(config)
