@@ -59,3 +59,9 @@ config/config.yaml
 
 # Flow capture files from mitmproxy
 *.flow
+captured_flows.txt
+mitmproxy_output.txt
+proxy_out.txt
+start_dump.py
+start_proxy.py
+capture_setup.bat
