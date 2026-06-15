@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  court-bot:
+    build: .
+    container_name: court-bot
+    volumes:
+      - ./config:/app/config:ro      # read-only config
+      - ./logs:/app/logs              # persistent logs
+    environment:
+      - TZ=Asia/Shanghai
+      - COURT_BOT_PASSWORD=${COURT_BOT_PASSWORD:-}
+    restart: "no"
+    command: run
+
+  # Optional: web UI (requires court-bot[webui] extra)
+  # court-bot-web:
+  #   build: .
+  #   container_name: court-bot-web
+  #   ports:
+  #     - "8080:8080"
+  #   volumes:
+  #     - ./config:/app/config:ro
+  #   environment:
+  #     - TZ=Asia/Shanghai
+  #   command: web

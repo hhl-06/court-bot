@@ -1,0 +1,110 @@
+# ============================================================
+# Court Bot — Example Configuration
+# ============================================================
+# Copy this to config/config.yaml and fill in your details.
+#
+# Sensitive values support ${ENV_VAR} syntax:
+#   password: "${COURT_BOT_PASSWORD}"
+#
+# Generate a fresh copy anytime with:
+#   court-bot init-config
+
+# ── Platform ──────────────────────────────────────────────
+# Which platform adapter to use.
+#   wechat_miniapp  — WeChat Mini Program (most Chinese universities)
+#   web_portal       — Traditional website (Selenium-based)
+#   custom_api       — Any REST API (configure endpoints below)
+platform: wechat_miniapp
+
+# ── Authentication ────────────────────────────────────────
+auth:
+  student_id: "2021001234"
+  password: "${COURT_BOT_PASSWORD}"     # Use env var for security
+  login_type: auto                      # auto | wechat | cas | direct | token
+
+  # Advanced: if you already have a token, paste it here to skip login
+  token: ""
+
+  # Advanced: WeChat-specific (only if login_type=wechat)
+  wechat_code: ""
+
+# ── Booking Preferences ───────────────────────────────────
+booking:
+  court_type: "羽毛球"                   # Court type name (as shown in system)
+  date_offset: 1                        # Book N days ahead
+  preferred_times:                      # Time slots by priority
+    - "09:00-10:00"
+    - "10:00-11:00"
+    - "11:00-12:00"
+  preferred_courts:                     # Court numbers by priority (1-based)
+    - 1
+    - 2
+    - 3
+  fallback_to_any: true                 # If preferred slots taken, try any available
+  max_candidates: 20                    # Max candidates to try
+
+# ── Schedule ──────────────────────────────────────────────
+schedule:
+  open_time: "20:00:00"                 # When booking opens (HH:MM:SS)
+  pre_fetch_seconds: 5                  # Seconds before opening to load data
+  fire_early_ms: 80                     # Fire this many ms early (network latency compensation)
+  timezone: "Asia/Shanghai"
+
+# ── Notifications ─────────────────────────────────────────
+# Configure at least one channel to receive booking results.
+notify:
+  # Bark (iOS push) — https://bark.day.app
+  bark_key: ""
+
+  # DingTalk (钉钉) bot webhook
+  dingtalk_webhook: ""
+
+  # Server酱 (WeChat push) — https://sct.ftqq.com
+  server_chan_key: ""
+
+  # PushPlus (WeChat push) — https://www.pushplus.plus
+  pushplus_token: ""
+
+  # Telegram bot
+  telegram_bot_token: ""
+  telegram_chat_id: ""
+
+  # Email (SMTP)
+  email_smtp_host: "smtp.qq.com"
+  email_smtp_port: 465
+  email_sender: ""
+  email_password: ""
+  email_receiver: ""
+
+# ── Advanced ──────────────────────────────────────────────
+advanced:
+  retry_count: 3                        # Retries per candidate
+  retry_interval: 0.15                  # Seconds between retries
+  time_sync: true                       # Sync with NTP server before booking
+  ntp_server: "ntp.aliyun.com"         # NTP server (China-friendly default)
+  request_timeout: 8.0                  # HTTP request timeout (seconds)
+  rate_limit: 5.0                       # Max requests per second
+  dry_run: false                        # true = fetch but don't submit
+  log_level: "INFO"                     # DEBUG | INFO | WARNING | ERROR
+
+# ── Custom (for custom_api platform) ──────────────────────
+# Fill this section if using platform: custom_api.
+# All URLs and field mappings are configurable here.
+custom:
+  # base_url: "https://api.school.edu/v1"
+  # endpoints:
+  #   login: "/auth/login"
+  #   courts: "/courts"
+  #   slots: "/courts/{court_id}/slots"
+  #   book: "/bookings"
+  #   my_bookings: "/bookings/mine"
+  # auth_header: "Authorization"
+  # auth_format: "Bearer {token}"
+  # field_mappings:
+  #   login_success: "code == 0"
+  #   token_path: "data.token"
+  #   court_list_path: "data.courts"
+  #   slot_list_path: "data"
+  #   book_success: "code == 0"
+  #   booking_id_path: "data.bookingId"
+  #   message_path: "message"

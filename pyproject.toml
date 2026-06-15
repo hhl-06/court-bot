@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "court-bot"
+version = "1.0.0"
+description = "Automated court booking bot with multi-platform support, precise scheduling, and rich notifications"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Court Bot Contributors"}
+]
+keywords = ["booking", "automation", "sports", "badminton", "court", "scheduler"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Utilities",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.25.0",
+    "pyyaml>=6.0",
+    "rich>=13.0.0",
+    "ntplib>=0.4.0",
+    "apscheduler>=3.10.0",
+    "pydantic>=2.0",
+    "typer>=0.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.1",
+    "mypy>=1.0",
+]
+captcha = [
+    "ddddocr>=1.4",
+]
+webui = [
+    "fastapi>=0.100",
+    "uvicorn>=0.23",
+    "jinja2>=3.1",
+]
+all = [
+    "court-bot[dev,captcha,webui]",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/court-bot"
+Documentation = "https://github.com/yourusername/court-bot#readme"
+Repository = "https://github.com/yourusername/court-bot.git"
+Issues = "https://github.com/yourusername/court-bot/issues"
+
+[project.scripts]
+court-bot = "court_bot.cli.main:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
