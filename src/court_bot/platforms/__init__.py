@@ -15,11 +15,13 @@ from court_bot.platforms.base import BasePlatform
 from court_bot.platforms.wechat_miniapp import WechatMiniAppPlatform
 from court_bot.platforms.web_portal import WebPortalPlatform
 from court_bot.platforms.custom_api import CustomAPIPlatform
+from court_bot.platforms.njucm import NJUCMPlatform
 
 PLATFORM_REGISTRY: dict[str, type[BasePlatform]] = {
     "wechat_miniapp": WechatMiniAppPlatform,
     "web_portal": WebPortalPlatform,
     "custom_api": CustomAPIPlatform,
+    "njucm": NJUCMPlatform,
 }
 
 
