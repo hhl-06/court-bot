@@ -2,13 +2,15 @@
 南京中医药大学 (NJUCM) — 体育馆场地预约平台适配器
 
 API 接口来自 mitmproxy 抓包分析 (2026-06-15)
-系统由诺彩智慧场馆提供 (nuocaimespublic.oss-cn-beijing.aliyuncs.com)
+系统由诺彩智慧场馆提供
 
 关键 ID:
   - 小程序 AppID:  wx69041881ef731d55
   - 体育馆 ID:     1881595713595396097
   - 羽毛球场地 ID:  1881595935872536578
   - 乒乓球场地 ID:  1881596027069288449
+  - 场地号:         1号(1881606335821271041) ~ 8号(1881606600058228738)
+  - 营业时间:       08:30-21:30, 每60分钟一段
 """
 
 from __future__ import annotations
@@ -30,12 +32,11 @@ logger = logging.getLogger(__name__)
 class NJUCMPlatform(BasePlatform):
     """南京中医药大学体育馆预约平台适配器"""
 
-    # ── 固定配置 ─────────────────────────────────────────
     BASE_URL = "https://gym.njucm.edu.cn/gym-api"
     APP_ID = "wx69041881ef731d55"
     STADIUM_ID = "1881595713595396097"
 
-    # 场地类型 → placeId 映射
+    # 场地类型 → placeId
     PLACE_MAP: dict[str, str] = {
         "羽毛球": "1881595935872536578",
         "badminton": "1881595935872536578",
@@ -43,7 +44,22 @@ class NJUCMPlatform(BasePlatform):
         "tabletennis": "1881596027069288449",
     }
 
-    # ─────────────────────────────────────────────────────
+    # 场地号 → placeAreaId (从 API 动态获取，这是静态缓存)
+    AREA_NAME_MAP: dict[int, str] = {
+        1: "1881606335821271041",
+        2: "1881606382399016961",
+        3: "1881606414166675458",
+        4: "1881606462027878401",
+        5: "1881606492205895681",
+        6: "1881606534392205313",
+        7: "1881606572421959681",
+        8: "1881606600058228738",
+    }
+
+    # 营业规则 (从 API rules 中获取: startTime=08:30, endTime=21:30, unit=60)
+    OPEN_START = "08:30"
+    OPEN_END = "21:30"
+    SLOT_UNIT = 60  # 分钟
 
     def __init__(self, config: AppConfig):
         super().__init__(config)
@@ -53,7 +69,6 @@ class NJUCMPlatform(BasePlatform):
             max_retries=config.advanced.retry_count,
             rate_limit=config.advanced.rate_limit,
         )
-        # 设置微信小程序必要的 Header
         self.session.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -67,49 +82,26 @@ class NJUCMPlatform(BasePlatform):
             "Referer": f"https://servicewechat.com/{self.APP_ID}/23/page-frame.html",
         })
         self._token: str = ""
-        self._user_info: dict[str, Any] = {}
-        self._place_id_cache: dict[str, str] = {}  # court_name → placeId
+        self._area_cache: dict[str, dict] = {}  # area_id → {name, rules}
 
     # ── Authentication ───────────────────────────────────
 
     def authenticate(self) -> bool:
-        """
-        登录流程 (微信小程序):
-        1. 使用 wx.login() 获取 authCode
-        2. POST /authserver/wx/login 换取 accessToken
-
-        注意: wx.login() 的 code 只有 5 分钟有效期，且只能使用一次。
-        如果你有持久化的 token，可以提前在 config 中设置 auth.token。
-        """
         auth_cfg = self.config.auth
-
-        # Strategy 1: 预置 token (跳过登录)
         if auth_cfg.token:
-            logger.info("使用预置 token")
             self._token = auth_cfg.token
             self._set_auth_header()
             self._authenticated = True
             return True
 
-        # Strategy 2: 微信 code 换 token (标准流程)
         wx_code = auth_cfg.wechat_code
         if not wx_code:
-            logger.error(
-                "需要微信登录 code。请在 config.auth.wechat_code 中填入 "
-                "wx.login() 返回的 code，或在手机微信中抓包获取 code。\n"
-                "替代方案: 在 config.auth.token 中直接填入已有的 accessToken。"
-            )
+            logger.error("需要 token 或 wechat_code。在 config.auth 中配置。")
             return False
-
         return self._login_with_code(wx_code)
 
     def _login_with_code(self, wx_code: str) -> bool:
-        """用 wx.login() code 换取 access token"""
-        logger.info("微信 code 登录中...")
-
-        # Basic auth: base64(appId)
         basic = b64encode(self.APP_ID.encode()).decode()
-
         resp = self.session.post(
             "/authserver/wx/login",
             data={"authCode": wx_code},
@@ -120,27 +112,14 @@ class NJUCMPlatform(BasePlatform):
         )
         if not resp:
             return False
-
         data = resp.json()
-        logger.debug("Login response: %s", data)
-
         if not data.get("success"):
-            logger.error("登录失败: %s", data.get("errMessage", "未知错误"))
+            logger.error("登录失败: %s", data.get("errMessage"))
             return False
-
-        token_data = data.get("data", {})
-        self._token = token_data.get("accessToken", "")
-        if not self._token:
-            logger.error("未获取到 accessToken")
-            return False
-
-        logger.info(
-            "登录成功, token 有效期至 %s",
-            token_data.get("expiration", "未知"),
-        )
-
+        self._token = data["data"]["accessToken"]
         self._set_auth_header()
         self._authenticated = True
+        logger.info("登录成功, 有效期至 %s", data["data"].get("expiration"))
         return True
 
     def _set_auth_header(self) -> None:
@@ -149,58 +128,41 @@ class NJUCMPlatform(BasePlatform):
     # ── Court / Slot Fetching ────────────────────────────
 
     def fetch_courts(self, court_type: str = "") -> list[CourtInfo]:
-        """
-        获取场馆下的场地列表。
-
-        实际 API: POST /basic/api/stadium/miniGetPlaceList
-        """
         resp = self.session.post(
             "/basic/api/stadium/miniGetPlaceList",
             json={"stadiumId": self.STADIUM_ID},
         )
         if not resp:
             return []
-
         data = resp.json()
         places = data.get("data", [])
-
         courts = []
         for p in places:
-            place_name = p.get("placeName", "未知")
-            place_id = p.get("placeId", "")
-
-            # 缓存 placeId
-            self._place_id_cache[place_name] = place_id
-
-            # 过滤场地类型 (如果指定)
-            if court_type and court_type not in place_name:
+            name = p.get("placeName", "未知")
+            if court_type and court_type not in name:
                 continue
-
             courts.append(CourtInfo(
-                court_id=place_id,
-                court_name=place_name,
-                court_number=0,  # 场地编号在子场地中
-                location=p.get("placeAddress", ""),
+                court_id=p.get("placeId", ""),
+                court_name=name,
+                court_number=0,
                 extra=p,
             ))
-
         logger.info("获取到 %d 个场地类型", len(courts))
         return courts
 
     def fetch_slots(self, date: str, court_id: str = "") -> list[SlotInfo]:
         """
-        获取某日某场地的已预约时段，然后推断可用时段。
+        获取某日某场地类型下所有场地的可用时段。
 
-        实际 API: POST /order/place/ticket/getOrdersByDateAndPlaceId
-
-        注意：这个接口返回的是已预约的时段。
-        可用时段 = 全天可选时段 - 已预约时段
+        流程:
+        1. 调 getOrdersByDateAndPlaceId → 拿到 1-8号场地 + 每个场地的 rules
+        2. 从 rules 生成全天所有可能时段 (08:30-21:30, 每60分钟)
+        3. 已预约的标记为 unavailable
+        4. 返回按场地号+时间排序的结果
         """
         if not court_id:
-            logger.warning("未指定 court_id，无法查询时段")
             return []
 
-        # 1. 获取已预约时段
         resp = self.session.post(
             "/order/place/ticket/getOrdersByDateAndPlaceId",
             json={"date": date, "placeId": court_id},
@@ -210,118 +172,75 @@ class NJUCMPlatform(BasePlatform):
 
         data = resp.json()
         if not data.get("success"):
+            logger.warning("获取时段失败: %s", data.get("errMessage"))
             return []
 
-        booked_set: set[str] = set()
         order_data = data.get("data", {})
+        slots: list[SlotInfo] = []
 
-        # allPlace: 整场预约
-        for area in order_data.get("allPlace", []):
-            for order in area.get("orders", []):
-                key = f"{order['startTime']}-{order['endTime']}"
-                booked_set.add(key)
+        # 遍历所有场地 (allPlace) 和半场 (halfPlace)
+        for area_type_key in ("allPlace", "halfPlace"):
+            for area in order_data.get(area_type_key, []):
+                area_id = area.get("placeAreaId", "")
+                area_name = area.get("placeAreaName", "未知")
 
-        # halfPlace: 半场预约
-        for area in order_data.get("halfPlace", []):
-            for order in area.get("orders", []):
-                key = f"{order['startTime']}-{order['endTime']}"
-                booked_set.add(key)
+                # 缓存场地信息
+                self._area_cache[area_id] = area
 
-        # 2. 获取全天可选时段范围 (从 buy-rule 推断)
-        all_slots = self._get_all_possible_slots(date, court_id)
-        if not all_slots:
-            logger.warning("无法获取可选时段列表，可能该日期未开放")
-            return []
+                # 从 rules 获取该场地的营业规则
+                rules = area.get("rules", [])
+                if not rules:
+                    continue
 
-        # 3. 计算可用时段
-        slots = []
-        for start, end in all_slots:
-            key = f"{start}-{end}"
-            available = key not in booked_set
-            slots.append(SlotInfo(
-                slot_id=f"{court_id}_{start}_{end}",
-                start_time=start,
-                end_time=end,
-                available=available,
-            ))
+                rule = rules[0]  # 取第一条规则
+                open_start = rule.get("startTime", self.OPEN_START)
+                open_end = rule.get("endTime", self.OPEN_END)
+                unit_minutes = rule.get("unit", self.SLOT_UNIT)
+
+                # 生成该场地所有可能的时段
+                all_possible = self._generate_time_slots(open_start, open_end, unit_minutes)
+
+                # 收集已预约时段
+                booked_set: set[str] = set()
+                for order in area.get("orders") or []:
+                    booked_set.add(f"{order['startTime']}-{order['endTime']}")
+
+                # 标记可用/已约
+                for start_t, end_t in all_possible:
+                    key = f"{start_t}-{end_t}"
+                    slots.append(SlotInfo(
+                        slot_id=f"{area_id}_{start_t}_{end_t}",
+                        start_time=start_t,
+                        end_time=end_t,
+                        available=key not in booked_set,
+                        extra={
+                            "area_id": area_id,
+                            "area_name": area_name,
+                            "place_id": court_id,
+                        },
+                    ))
 
         available_count = sum(1 for s in slots if s.available)
-        logger.info(
-            "%s: %d/%d 时段可用", date, available_count, len(slots),
-        )
+        logger.info("%s: %d/%d 时段可用", date, available_count, len(slots))
         return slots
 
-    def _get_all_possible_slots(
-        self, date: str, place_id: str,
-    ) -> list[tuple[str, str]]:
-        """
-        获取某日某场地的所有可选时段。
+    @staticmethod
+    def _generate_time_slots(start: str, end: str, unit_min: int) -> list[tuple[str, str]]:
+        """根据起止时间和单位生成所有时段，如 08:30, 09:30, 10:30..."""
+        def _to_min(t: str) -> int:
+            h, m = t.split(":")
+            return int(h) * 60 + int(m)
 
-        方案: 通过 sport-plan/home 接口获取场地配置，
-        或通过 getAreaPriceByPlaceIdAndWeek 获取价格表来推断时段。
-        """
-        # 尝试从已预约数据获取场地区域列表
-        resp = self.session.post(
-            "/order/place/ticket/getOrdersByDateAndPlaceId",
-            json={"date": date, "placeId": place_id},
-        )
-        if not resp:
-            return []
+        def _to_str(m: int) -> str:
+            return f"{m // 60:02d}:{m % 60:02d}"
 
-        data = resp.json()
-        if not data.get("success"):
-            return []
-
-        # 从返回的场地列表推断时段
-        # 场馆通常在特定时段开放 (如 9:00-21:00，每小时一段)
-        # 具体时段从已有订单中推断
-        all_slots: list[tuple[str, str]] = []
-        seen: set[str] = set()
-
-        order_data = data.get("data", {})
-
-        # 包含所有场地区域 (即使是已预约的也用于获取时段模板)
-        for area in order_data.get("allPlace", []):
-            for order in area.get("orders", []):
-                slot_key = f"{order['startTime']}-{order['endTime']}"
-                if slot_key not in seen:
-                    seen.add(slot_key)
-                    all_slots.append((order["startTime"], order["endTime"]))
-
-        for area in order_data.get("halfPlace", []):
-            for order in area.get("orders", []):
-                slot_key = f"{order['startTime']}-{order['endTime']}"
-                if slot_key not in seen:
-                    seen.add(slot_key)
-                    all_slots.append((order["startTime"], order["endTime"]))
-
-        # 如果当天没有已预约时段 (全是空的), 尝试从运动计划获取
-        if not all_slots:
-            all_slots = self._get_slots_from_sport_plan(date, place_id)
-
-        # 按时间排序
-        all_slots.sort(key=lambda x: x[0])
-        return all_slots
-
-    def _get_slots_from_sport_plan(
-        self, date: str, place_id: str,
-    ) -> list[tuple[str, str]]:
-        """从运动计划接口获取可选时段"""
-        resp = self.session.get(
-            "/order/sport-plan/home",
-            params={"stadiumId": self.STADIUM_ID},
-        )
-        if not resp:
-            return []
-
-        data = resp.json()
-        if not data.get("success"):
-            return []
-
-        # sport-plan/home 返回各场地的时间计划
-        # 具体解析逻辑视实际返回结构调整
-        slots: list[tuple[str, str]] = []
-        # TODO: 根据实际返回结构解析时段
+        start_min = _to_min(start)
+        end_min = _to_min(end)
+        slots = []
+        cur = start_min
+        while cur + unit_min <= end_min:
+            slots.append((_to_str(cur), _to_str(cur + unit_min)))
+            cur += unit_min
         return slots
 
     # ── Booking ──────────────────────────────────────────
@@ -330,28 +249,29 @@ class NJUCMPlatform(BasePlatform):
         """
         提交预约。
 
-        ⚠️ 预约接口未在抓包中捕获 (当时场地全满)。
-        根据系统通用模式，推测接口为:
-          POST /order/place/ticket/create
-
-        如果实际接口不同，请根据一次成功的预约抓包结果调整。
+        ⚠️ 接口未在抓包中验证 (当时全满)。
+        根据同类系统推测为: POST /order/place/ticket/create
         """
         start = time.monotonic()
 
-        # ── 推测的预约请求体 ─────────────────────────────
-        payload = {
-            "placeId": candidate.court_id,
+        # 从 candidate 获取场地 area 信息
+        area_id = (
+            candidate.raw_slot.get("area_id", "")
+            or candidate.raw_court.get("area_id", "")
+        )
+        place_id = candidate.court_id
+
+        payload: dict[str, Any] = {
+            "placeId": place_id,
+            "placeAreaId": area_id,
             "date": date,
             "startTime": candidate.start_time,
             "endTime": candidate.end_time,
             "saleChannel": self.APP_ID,
-            # 可能还需要:
-            # "placeAreaId": "...",
-            # "stadiumId": self.STADIUM_ID,
         }
 
         resp = self.session.post(
-            "/order/place/ticket/create",    # ← 推测的接口，需验证
+            "/order/place/ticket/create",  # ← 推测接口，需验证
             json=payload,
         )
         elapsed = time.monotonic() - start
@@ -367,16 +287,12 @@ class NJUCMPlatform(BasePlatform):
         logger.debug("预约响应 (%.2fs): %s", elapsed, data)
 
         success = data.get("success", False)
-        msg = data.get("errMessage", "") or ""
+        msg = data.get("errMessage", "") or ("预约成功" if success else "预约失败")
 
         booking_id = ""
         if success:
-            booking_id = data.get("data", {}).get("businessOrderNo", "")
-            if not booking_id:
-                booking_id = data.get("data", {}).get("orderNo", "")
-
-        if not success and not msg:
-            msg = "预约失败 (可能是系统繁忙或已约满)"
+            b_data = data.get("data", {})
+            booking_id = b_data.get("businessOrderNo", b_data.get("orderNo", ""))
 
         return BookingResult(
             success=success,
@@ -387,28 +303,100 @@ class NJUCMPlatform(BasePlatform):
             raw_response=data,
         )
 
+    # ── Override: find_candidates with area support ──────
+
+    def find_candidates(
+        self,
+        date: str,
+        court_type: str = "",
+        preferred_courts: list[int] | None = None,
+        preferred_times: list[str] | None = None,
+        fallback_to_any: bool = True,
+        max_candidates: int = 20,
+    ) -> list[Candidate]:
+        """
+        构建候选列表，支持场地号偏好。
+
+        preferred_courts 在这里是场地号 (1-8)，不是场地类型。
+        """
+        preferred_courts = preferred_courts or []
+        preferred_times = preferred_times or []
+
+        # 确定 placeId
+        place_id = ""
+        for name, pid in self.PLACE_MAP.items():
+            if court_type and (court_type in name or name in court_type):
+                place_id = pid
+                break
+        if not place_id:
+            courts = self.fetch_courts(court_type)
+            if courts:
+                place_id = courts[0].court_id
+        if not place_id:
+            return []
+
+        # 获取所有时段
+        slots = self.fetch_slots(date, place_id)
+        available = [s for s in slots if s.available]
+        if not available:
+            logger.warning("没有可用时段")
+            return []
+
+        # 构建候选并排序
+        scored: list[tuple[int, int, Candidate]] = []
+        for slot in available:
+            area_id = slot.extra.get("area_id", "")
+            area_name = slot.extra.get("area_name", "")
+
+            # 从场地名提取编号 (如 "1号场地" → 1)
+            area_num = 0
+            for i in range(1, 9):
+                if f"{i}号" in area_name:
+                    area_num = i
+                    break
+
+            # 计算偏好排名
+            court_rank = preferred_courts.index(area_num) if area_num in preferred_courts else len(preferred_courts)
+            time_rank = preferred_times.index(slot.label) if slot.label in preferred_times else len(preferred_times)
+
+            c = Candidate(
+                court_id=place_id,
+                court_name=f"羽毛球 {area_name}",
+                court_number=area_num,
+                slot_id=slot.slot_id,
+                slot_label=slot.label,
+                start_time=slot.start_time,
+                end_time=slot.end_time,
+                raw_court={"place_id": place_id, "area_id": area_id, "area_name": area_name},
+                raw_slot={"area_id": area_id, **slot.extra},
+            )
+            scored.append((court_rank, time_rank, c))
+
+        scored.sort(key=lambda x: (x[0], x[1]))
+
+        if not fallback_to_any:
+            scored = [(cr, tr, c) for cr, tr, c in scored
+                      if cr < len(preferred_courts) and tr < len(preferred_times)]
+
+        candidates = [c for _, _, c in scored[:max_candidates]]
+        logger.info("找到 %d 个候选 (%s)", len(candidates), date)
+        for i, c in enumerate(candidates[:8]):
+            logger.info("  候选 %d: %s %s", i + 1, c.court_name, c.slot_label)
+
+        return candidates
+
     # ── Utilities ────────────────────────────────────────
 
-    def get_my_bookings(self) -> list[dict]:
-        """查询已有预约"""
-        # 从 user-info/detail 可能包含预约历史
-        resp = self.session.get("/order/user-info/detail")
-        if resp:
-            data = resp.json()
-            logger.debug("User info: %s", data)
-        return []
-
     def get_place_id(self, court_type: str) -> str:
-        """根据场地类型名获取 placeId"""
-        # 先查缓存
         for name, pid in self.PLACE_MAP.items():
             if court_type in name or name in court_type:
                 return pid
-        # 从 API 获取
         courts = self.fetch_courts(court_type)
-        if courts:
-            return courts[0].court_id
-        return ""
+        return courts[0].court_id if courts else ""
+
+    def get_my_bookings(self) -> list[dict]:
+        resp = self.session.get("/order/user-info/detail")
+        return [resp.json()] if resp and resp.status_code == 200 else []
 
     def close(self) -> None:
         self.session.close()
