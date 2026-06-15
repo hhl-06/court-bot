@@ -15,6 +15,7 @@ import time
 import logging
 from datetime import datetime, timedelta
 
+from court_bot.core.campus_net import campus_network_login
 from court_bot.core.config import AppConfig
 from court_bot.core.time_sync import TimeSync
 from court_bot.platforms.base import BasePlatform, BookingResult
@@ -125,13 +126,14 @@ class BookingScheduler:
         """
         Keep retrying until the API server is reachable.
 
-        Campus networks often disconnect overnight. This waits up to
-        *timeout* seconds for connectivity before proceeding.
+        If campus network requires login (portal auth), auto-login first.
+        Waits up to *timeout* seconds for connectivity before proceeding.
         """
         import socket
         deadline = time.time() + timeout
         host = "gym.njucm.edu.cn"
         port = 443
+        tried_portal = False
 
         while time.time() < deadline:
             try:
@@ -141,6 +143,20 @@ class BookingScheduler:
                 return
             except OSError:
                 remaining = int(deadline - time.time())
+
+                # Try campus portal login if we haven't yet
+                if not tried_portal:
+                    auth_cfg = self.config.auth
+                    if auth_cfg.student_id and auth_cfg.password:
+                        logger.info("Network down, trying campus portal login...")
+                        campus_network_login(
+                            username=auth_cfg.student_id,
+                            password=auth_cfg.password,
+                        )
+                        tried_portal = True
+                        time.sleep(3)
+                        continue
+
                 logger.warning(
                     "Network unreachable — retrying (timeout in %ds)...", remaining,
                 )
