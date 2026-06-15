@@ -2,12 +2,13 @@
 Booking scheduler — the central orchestration engine.
 
 Orchestrates the full booking workflow:
-  1. Sync network time
-  2. Authenticate
-  3. Pre-fetch court / slot data just before opening
-  4. Fire booking requests with sub-second precision
-  5. Retry on failure, fallback through candidates
-  6. Notify result
+  1. Wait for network (campus WiFi may drop overnight)
+  2. Sync network time
+  3. Authenticate
+  4. Pre-fetch court / slot data just before opening
+  5. Fire booking requests with sub-second precision
+  6. Retry on failure, fallback through candidates
+  7. Notify result
 """
 
 import time
@@ -48,11 +49,14 @@ class BookingScheduler:
         logger.info("  Platform: %s", self.config.platform)
         logger.info("=" * 60)
 
-        # 1. Time sync
+        # 1. Wait for network (campus network may drop overnight)
+        self._wait_for_network()
+
+        # 2. Time sync
         if self.config.advanced.time_sync:
             self.time_sync.sync()
 
-        # 2. Authenticate
+        # 3. Authenticate
         logger.info("Authenticating...")
         if not self.platform.authenticate():
             logger.error("Authentication failed — aborting")
@@ -116,6 +120,33 @@ class BookingScheduler:
             )
 
         return result
+
+    def _wait_for_network(self, timeout: int = 300) -> None:
+        """
+        Keep retrying until the API server is reachable.
+
+        Campus networks often disconnect overnight. This waits up to
+        *timeout* seconds for connectivity before proceeding.
+        """
+        import socket
+        deadline = time.time() + timeout
+        host = "gym.njucm.edu.cn"
+        port = 443
+
+        while time.time() < deadline:
+            try:
+                sock = socket.create_connection((host, port), timeout=5)
+                sock.close()
+                logger.info("Network reachable ✓")
+                return
+            except OSError:
+                remaining = int(deadline - time.time())
+                logger.warning(
+                    "Network unreachable — retrying (timeout in %ds)...", remaining,
+                )
+                time.sleep(5)
+
+        logger.error("Network still unreachable after %ds — proceeding anyway", timeout)
 
     # ── internals ─────────────────────────────────────────
 
