@@ -14,6 +14,10 @@ import time
 from pathlib import Path
 from typing import Optional
 
+# Fix encoding for CJK output on Windows
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 import typer
 from rich.console import Console
 from rich.panel import Panel

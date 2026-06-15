@@ -32,13 +32,17 @@ def setup_logging(
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(file_fmt)
 
-    # Console handler: beautiful Rich output
+    # Console handler: Rich output (with CJK-safe encoding)
+    try:
+        _console = console or Console(encoding="utf-8", force_terminal=True)
+    except Exception:
+        _console = Console()
     ch = RichHandler(
-        console=console or Console(),
+        console=_console,
         show_time=True,
         show_level=True,
         show_path=False,
-        rich_tracebacks=True,
+        rich_tracebacks=False,  # avoid encoding issues on Windows GBK
     )
     ch.setLevel(getattr(logging, level.upper(), logging.INFO))
 
