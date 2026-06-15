@@ -364,7 +364,7 @@ class NJUCMPlatform(BasePlatform):
 
             # 计算偏好排名
             court_rank = preferred_courts.index(area_num) if area_num in preferred_courts else len(preferred_courts)
-            time_rank = preferred_times.index(slot.label) if slot.label in preferred_times else len(preferred_times)
+            time_rank = self._match_time_preference(slot.label, preferred_times)
 
             c = Candidate(
                 court_id=place_id,
@@ -391,6 +391,39 @@ class NJUCMPlatform(BasePlatform):
             logger.info("  候选 %d: %s %s", i + 1, c.court_name, c.slot_label)
 
         return candidates
+
+    @staticmethod
+    def _match_time_preference(slot_label: str, preferred: list[str]) -> int:
+        """
+        匹配时段偏好排名。
+
+        对每个偏好项，先精确匹配，再范围匹配。第一个命中的返回其排名。
+          精确匹配: "18:30-19:30" in list → rank
+          范围匹配: "18:30-20:30" 包含 "18:30-19:30" → rank of the range
+        """
+        def _to_min(t: str) -> int:
+            h, m = t.split(":")
+            return int(h) * 60 + int(m)
+
+        slot_parts = slot_label.split("-")
+        if len(slot_parts) != 2:
+            return len(preferred)
+        slot_start = _to_min(slot_parts[0])
+        slot_end = _to_min(slot_parts[1])
+
+        for idx, pref in enumerate(preferred):
+            # 精确匹配
+            if slot_label == pref:
+                return idx
+            # 范围匹配: slot 完全在偏好范围内
+            pref_parts = pref.split("-")
+            if len(pref_parts) == 2:
+                pref_start = _to_min(pref_parts[0])
+                pref_end = _to_min(pref_parts[1])
+                if slot_start >= pref_start and slot_end <= pref_end:
+                    return idx
+
+        return len(preferred)
 
     # ── Utilities ────────────────────────────────────────
 
