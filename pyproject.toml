@@ -58,10 +58,10 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/court-bot"
-Documentation = "https://github.com/yourusername/court-bot#readme"
-Repository = "https://github.com/yourusername/court-bot.git"
-Issues = "https://github.com/yourusername/court-bot/issues"
+Homepage = "https://gitee.com/hhl-06/court-bot"
+Documentation = "https://gitee.com/hhl-06/court-bot#readme"
+Repository = "https://gitee.com/hhl-06/court-bot.git"
+Issues = "https://gitee.com/hhl-06/court-bot/issues"
 
 [project.scripts]
 court-bot = "court_bot.cli.main:app"
