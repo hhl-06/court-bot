@@ -50,7 +50,10 @@ class BookingScheduler:
         logger.info("  Platform: %s", self.config.platform)
         logger.info("=" * 60)
 
-        # 1. Wait for network (campus network may drop overnight)
+        # 1. Campus network login (always, not just when network appears down)
+        self._ensure_campus_network()
+
+        # 2. Wait for network (campus network may drop overnight)
         self._wait_for_network()
 
         # 2. Time sync
@@ -121,6 +124,22 @@ class BookingScheduler:
             )
 
         return result
+
+    def _ensure_campus_network(self) -> None:
+        """
+        主动登录校园网（每次运行都尝试）。
+
+        Dr.COM 认证系统允许重复登录 (reply_code=255 = 已在线)。
+        这样不管是刚断线还是没认证，都能保证网络可用。
+        """
+        from court_bot.core.campus_net import campus_network_login
+        auth_cfg = self.config.auth
+        if auth_cfg.student_id and auth_cfg.password:
+            logger.info("正在确保校园网已认证...")
+            campus_network_login(
+                username=auth_cfg.student_id,
+                password=auth_cfg.password,
+            )
 
     def _wait_for_network(self, timeout: int = 300) -> None:
         """
