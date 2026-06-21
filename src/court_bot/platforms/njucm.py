@@ -103,6 +103,7 @@ class NJUCMPlatform(BasePlatform):
             self._token = auth_cfg.token
             self._set_auth_header()
             self._authenticated = True
+            self._check_token_expiry()
             return True
 
         wx_code = auth_cfg.wechat_code
@@ -110,6 +111,27 @@ class NJUCMPlatform(BasePlatform):
             logger.error("需要 token 或 wechat_code。在 config.auth 中配置。")
             return False
         return self._login_with_code(wx_code)
+
+    def _check_token_expiry(self) -> None:
+        """检测 token 是否即将过期 (< 6h)，通过通知提醒。"""
+        if not hasattr(self, '_token_expiration') or not self._token_expiration:
+            # 预配 token 没有 expiration 信息，静默跳过
+            return
+        try:
+            from datetime import datetime as dt
+            expiry = dt.strptime(self._token_expiration, "%Y-%m-%d %H:%M:%S")
+            remaining = expiry - dt.now()
+            hours = remaining.total_seconds() / 3600
+            if hours < 6:
+                from court_bot.notify.channels import Notifier
+                notifier = Notifier(self.config.notify)
+                notifier.send(
+                    "⚠️ Court Bot Token 即将过期",
+                    f"Token 将于 {self._token_expiration} 过期\n剩余 {hours:.1f} 小时\n请重新获取 wechat_code 更新 token",
+                )
+                logger.warning("Token 将在 %.1f 小时后过期，已发送通知", hours)
+        except Exception as e:
+            logger.debug("Token 过期检测异常: %s", e)
 
     def _login_with_code(self, wx_code: str) -> bool:
         basic = b64encode(self.APP_ID.encode()).decode()
@@ -128,9 +150,12 @@ class NJUCMPlatform(BasePlatform):
             logger.error("登录失败: %s", data.get("errMessage"))
             return False
         self._token = data["data"]["accessToken"]
+        self._refresh_token = data["data"].get("refreshToken", "")
+        self._token_expiration = data["data"].get("expiration", "")
         self._set_auth_header()
         self._authenticated = True
-        logger.info("登录成功, 有效期至 %s", data["data"].get("expiration"))
+        logger.info("登录成功, 有效期至 %s (refreshToken: %s...)",
+                    self._token_expiration, self._refresh_token[:12] if self._refresh_token else "无")
         return True
 
     def _set_auth_header(self) -> None:
