@@ -620,9 +620,10 @@ class NJUCMPlatform(BasePlatform):
 
         根据抓包分析，goodsId = placeAreaPriceId，通过 week 和时段匹配。
         """
-        # 计算星期几 (01-07)
+        # 计算星期几 (01=周日, 02=周一, ..., 07=周六)
+        # NJUCM 系统: 周日=01, ISO 周日=7
         dt = datetime.strptime(date, "%Y-%m-%d")
-        week = f"{dt.isoweekday():02d}"  # 1=周一 → "01"
+        week = f"{(dt.isoweekday() % 7) + 1:02d}"
 
         resp = self.session.get(
             "/order/place/ticket/getAreaPriceByPlaceIdAndWeek",
