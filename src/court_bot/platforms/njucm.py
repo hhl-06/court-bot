@@ -198,15 +198,18 @@ class NJUCMPlatform(BasePlatform):
                 # 缓存场地信息
                 self._area_cache[area_id] = area
 
-                # 从 rules 获取该场地的营业规则
-                rules = area.get("rules", [])
-                if not rules:
-                    continue
-
-                rule = rules[0]  # 取第一条规则
-                open_start = rule.get("startTime", self.OPEN_START)
-                open_end = rule.get("endTime", self.OPEN_END)
-                unit_minutes = rule.get("unit", self.SLOT_UNIT)
+                # 从 rules 获取该场地的营业规则 (可能为 null)
+                rules = area.get("rules") or []
+                if rules:
+                    rule = rules[0]
+                    open_start = rule.get("startTime", self.OPEN_START)
+                    open_end = rule.get("endTime", self.OPEN_END)
+                    unit_minutes = rule.get("unit", self.SLOT_UNIT)
+                else:
+                    # 回退到默认值 (08:30-21:30, 每60分钟)
+                    open_start = self.OPEN_START
+                    open_end = self.OPEN_END
+                    unit_minutes = self.SLOT_UNIT
 
                 # 生成该场地所有可能的时段
                 all_possible = self._generate_time_slots(open_start, open_end, unit_minutes)
