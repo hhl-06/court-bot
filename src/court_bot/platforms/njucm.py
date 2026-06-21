@@ -1,7 +1,8 @@
 """
 南京中医药大学 (NJUCM) — 体育馆场地预约平台适配器
 
-API 接口来自 mitmproxy 抓包分析 (2026-06-15)
+API 接口来自 mitmproxy 抓包分析 (2026-06-21)
+真实 API 流程: create → orderDetail → prePay → tapPay
 系统由诺彩智慧场馆提供
 
 关键 ID:
@@ -17,7 +18,10 @@ from __future__ import annotations
 
 import logging
 import time
+import secrets
+import uuid
 from base64 import b64encode
+from datetime import datetime
 from typing import Any
 
 from court_bot.core.config import AppConfig
@@ -254,60 +258,219 @@ class NJUCMPlatform(BasePlatform):
 
     def submit_booking(self, candidate: Candidate, date: str) -> BookingResult:
         """
-        提交预约。
+        提交预约 — 真实四段式流程:
 
-        ⚠️ 接口未在抓包中验证 (当时全满)。
-        根据同类系统推测为: POST /order/place/ticket/create
+        ① POST /order/v1/api/order/create     → businessOrderNo
+        ② POST /order/v1/api/order/orderDetail → businessSubOrderNo + goodsId
+        ③ POST /order/v1/api/order/prePay      → transNo
+        ④ POST /order/v1/api/order/tapPay      → 完成支付
         """
         start = time.monotonic()
 
-        # 从 candidate 获取场地 area 信息
         area_id = (
             candidate.raw_slot.get("area_id", "")
             or candidate.raw_court.get("area_id", "")
         )
         place_id = candidate.court_id
 
-        payload: dict[str, Any] = {
-            "placeId": place_id,
-            "placeAreaId": area_id,
-            "date": date,
-            "startTime": candidate.start_time,
-            "endTime": candidate.end_time,
-            "saleChannel": self.APP_ID,
-        }
-
-        resp = self.session.post(
-            "/order/place/ticket/create",  # ← 推测接口，需验证
-            json=payload,
-        )
-        elapsed = time.monotonic() - start
-
-        if not resp:
+        # ── 获取用户信息 ──────────────────────────────
+        user_info = self._get_user_info()
+        if not user_info:
             return BookingResult(
-                success=False, message="网络请求失败",
+                success=False, message="无法获取用户信息",
                 court_name=candidate.court_name,
                 slot_label=candidate.slot_label,
             )
+        user_id = user_info.get("userId", "")
+        customer_name = user_info.get("name", "")
 
+        # ── 获取 goodsId (从 getAreaPriceByPlaceIdAndWeek) ──
+        goods_id = self._get_goods_id(place_id, area_id, candidate.start_time, candidate.end_time, date)
+        if not goods_id:
+            logger.warning("未找到 goodsId，下单可能失败")
+
+        # ── ① Create ─────────────────────────────────
+        serial_num = self._generate_serial_num()
+        create_payload: dict[str, Any] = {
+            "userId": user_id,
+            "customerName": customer_name,
+            "userMobile": None,
+            "totalAmount": 0,
+            "pressure": True,
+            "businessType": "02",
+            "orderSource": self.APP_ID,
+            "serialNum": serial_num,
+            "stadiumId": self.STADIUM_ID,
+            "endDate": date,
+            "startDate": date,
+            "placeAreaList": [{
+                "startTime": candidate.start_time,
+                "endTime": candidate.end_time,
+                "placeAreaId": area_id,
+                "placeId": place_id,
+                "stadiumId": self.STADIUM_ID,
+            }],
+        }
+
+        resp = self.session.post("/order/v1/api/order/create", json=create_payload)
+        if not resp:
+            return BookingResult(
+                success=False, message="① create 网络请求失败",
+                court_name=candidate.court_name,
+                slot_label=candidate.slot_label,
+            )
         data = resp.json()
-        logger.debug("预约响应 (%.2fs): %s", elapsed, data)
+        if not data.get("success"):
+            msg = data.get("errMessage", "create 失败")
+            logger.error("① create 失败: %s", msg)
+            return BookingResult(success=False, message=str(msg),
+                                 court_name=candidate.court_name,
+                                 slot_label=candidate.slot_label,
+                                 raw_response=data)
+        business_order_no = data["data"]["businessOrderNo"]
+        logger.info("① create ✓ %s", business_order_no)
 
-        success = data.get("success", False)
-        msg = data.get("errMessage", "") or ("预约成功" if success else "预约失败")
+        # ── ② OrderDetail ────────────────────────────
+        detail_resp = self.session.post("/order/v1/api/order/orderDetail", json={
+            "businessOrderNo": business_order_no,
+            "businessType": "02",
+        })
+        if not detail_resp:
+            return BookingResult(
+                success=False, message="② orderDetail 网络请求失败",
+                court_name=candidate.court_name,
+                slot_label=candidate.slot_label,
+            )
+        detail_data = detail_resp.json()
+        if not detail_data.get("success"):
+            msg = detail_data.get("errMessage", "orderDetail 失败")
+            logger.error("② orderDetail 失败: %s", msg)
+            return BookingResult(success=False, message=str(msg),
+                                 court_name=candidate.court_name,
+                                 slot_label=candidate.slot_label,
+                                 raw_response=detail_data)
 
-        booking_id = ""
+        # 提取 subOrderNo 和 goodsId
+        sub_orders = detail_data.get("data", {}).get("businessSubOrderList", [])
+        sub_order_no = sub_orders[0]["businessSubOrderNo"] if sub_orders else ""
+        actual_goods_id = sub_orders[0].get("goodsId", goods_id) if sub_orders else goods_id
+        goods_name = sub_orders[0].get("goodsName", "") if sub_orders else ""
+        if not actual_goods_id:
+            logger.error("② orderDetail 未返回 goodsId")
+            return BookingResult(success=False, message="② 未获取到 goodsId",
+                                 court_name=candidate.court_name,
+                                 slot_label=candidate.slot_label,
+                                 raw_response=detail_data)
+        logger.info("② orderDetail ✓ goodsId=%s subOrder=%s", actual_goods_id, sub_order_no)
+
+        # ── ③ PrePay ─────────────────────────────────
+        client_id = self._get_or_create_client_id()
+        pre_pay_payload: dict[str, Any] = {
+            "businessOrderNo": business_order_no,
+            "clientId": client_id,
+            "remark": None,
+            "user": user_info,
+            "orderGoods": [{
+                "actAmount": 0,
+                "amount": 0,
+                "businessSubOrderNo": sub_order_no,
+                "freeAmount": 0,
+                "goodsId": actual_goods_id,
+                "goodsName": goods_name,
+                "goodsNum": 1,
+                "goodsType": "02",
+                "agreeAmount": 0,
+            }],
+            "preferentialGoods": {},
+            "smsNotice": False,
+        }
+
+        prepay_resp = self.session.post("/order/v1/api/order/prePay", json=pre_pay_payload)
+        if not prepay_resp:
+            return BookingResult(
+                success=False, message="③ prePay 网络请求失败",
+                court_name=candidate.court_name,
+                slot_label=candidate.slot_label,
+            )
+        prepay_data = prepay_resp.json()
+        if not prepay_data.get("success"):
+            msg = prepay_data.get("errMessage", "prePay 失败")
+            logger.error("③ prePay 失败: %s", msg)
+            return BookingResult(success=False, message=str(msg),
+                                 court_name=candidate.court_name,
+                                 slot_label=candidate.slot_label,
+                                 raw_response=prepay_data)
+        trans_no = prepay_data["data"]["transNo"]
+        amount = prepay_data["data"].get("amount", 0)
+        logger.info("③ prePay ✓ transNo=%s amount=%s", trans_no, amount)
+
+        # ── ④ TapPay (确认支付) ──────────────────────
+        tap_pay_payload: dict[str, Any] = {
+            "businessNo": business_order_no,
+            "clientId": client_id,
+            "memberCardId": "",
+            "openId": None,
+            "orderGoods": [{
+                "actAmount": 0,
+                "amount": 0,
+                "businessSubOrderNo": sub_order_no,
+                "freeAmount": 0,
+                "goodsId": actual_goods_id,
+                "goodsName": goods_name,
+                "goodsNum": 1,
+                "goodsType": "02",
+                "agreeAmount": 0,
+            }],
+            "orderSource": "GYM",
+            "payScene": "03,01",
+            "payChannel": "03",
+            "payWayCode": "ironman_student_card",
+            "payWayName": "学生卡",
+            "tansNo": trans_no,
+            "tenantCode": "1021",
+        }
+
+        tap_resp = self.session.post("/order/v1/api/order/tapPay", json=tap_pay_payload)
+        elapsed = time.monotonic() - start
+
+        if not tap_resp:
+            return BookingResult(
+                success=False, message="④ tapPay 网络请求失败",
+                court_name=candidate.court_name,
+                slot_label=candidate.slot_label,
+            )
+        tap_data = tap_resp.json()
+        logger.debug("预约完成 (%.2fs): %s", elapsed, tap_data)
+
+        success = tap_data.get("success", False)
         if success:
-            b_data = data.get("data", {})
-            booking_id = b_data.get("businessOrderNo", b_data.get("orderNo", ""))
+            tap_result = tap_data.get("data", {}).get("result", False)
+            if tap_result:
+                logger.info("预约成功! %s | %s", candidate.court_name, candidate.slot_label)
+                return BookingResult(
+                    success=True,
+                    booking_id=business_order_no,
+                    message="预约成功",
+                    court_name=candidate.court_name,
+                    slot_label=candidate.slot_label,
+                    raw_response=tap_data,
+                )
+            else:
+                msg = tap_data.get("data", {}).get("errorMsg", "支付结果返回失败")
+                logger.error("④ tapPay result=false: %s", msg)
+                return BookingResult(success=False, message=str(msg),
+                                     court_name=candidate.court_name,
+                                     slot_label=candidate.slot_label,
+                                     raw_response=tap_data)
 
+        msg = tap_data.get("errMessage", "tapPay 失败")
+        logger.error("④ tapPay 失败: %s", msg)
         return BookingResult(
-            success=success,
-            booking_id=str(booking_id),
+            success=False,
             message=str(msg),
             court_name=candidate.court_name,
             slot_label=candidate.slot_label,
-            raw_response=data,
+            raw_response=tap_data,
         )
 
     # ── Override: find_candidates with area support ──────
@@ -426,6 +589,96 @@ class NJUCMPlatform(BasePlatform):
         return len(preferred)
 
     # ── Utilities ────────────────────────────────────────
+
+    def _get_user_info(self) -> dict[str, Any]:
+        """获取当前登录用户信息 (缓存 30 分钟)。"""
+        now = time.time()
+        if hasattr(self, "_user_info_cache") and hasattr(self, "_user_info_ts"):
+            if now - self._user_info_ts < 1800:
+                return self._user_info_cache
+
+        resp = self.session.get("/order/user-info/detail")
+        if not resp or resp.status_code != 200:
+            logger.error("获取用户信息失败")
+            return {}
+        data = resp.json()
+        if data.get("success"):
+            self._user_info_cache = data.get("data", {})
+            self._user_info_ts = now
+            logger.info("用户: %s (ID=%s)", self._user_info_cache.get("name"),
+                        self._user_info_cache.get("userId"))
+            return self._user_info_cache
+        return {}
+
+    def _get_goods_id(self, place_id: str, area_id: str,
+                      start_time: str, end_time: str, date: str) -> str:
+        """
+        从 getAreaPriceByPlaceIdAndWeek 获取 goodsId。
+
+        根据抓包分析，goodsId = placeAreaPriceId，通过 week 和时段匹配。
+        """
+        # 计算星期几 (01-07)
+        dt = datetime.strptime(date, "%Y-%m-%d")
+        week = f"{dt.isoweekday():02d}"  # 1=周一 → "01"
+
+        resp = self.session.get(
+            "/order/place/ticket/getAreaPriceByPlaceIdAndWeek",
+            params={
+                "placeId": place_id,
+                "week": week,
+                "saleChannel": self.APP_ID,
+            },
+        )
+        if not resp:
+            return ""
+
+        data = resp.json()
+        if not data.get("success"):
+            return ""
+
+        areas_data = data.get("data", {})
+        for area_type_key in ("allPlace", "halfPlace"):
+            for area in areas_data.get(area_type_key, []):
+                if area.get("placeAreaId") != area_id:
+                    continue
+                for t in area.get("times", []):
+                    if t.get("startTime") == start_time and t.get("endTime") == end_time:
+                        goods_id = t.get("placeAreaPriceId", "")
+                        logger.info("找到 goodsId=%s (%s %s-%s week=%s)",
+                                    goods_id, area.get("placeAreaName"),
+                                    start_time, end_time, week)
+                        return goods_id
+
+        logger.warning("未找到匹配的 goodsId: area=%s %s-%s week=%s", area_id, start_time, end_time, week)
+        return ""
+
+    @staticmethod
+    def _generate_serial_num() -> str:
+        """
+        生成序列号，格式: YYYYMMDDHHmmssSSS#<randomHex>
+
+        示例: 20260621222734564#5a905c56
+        """
+        now = datetime.now()
+        ts = now.strftime("%Y%m%d%H%M%S") + f"{now.microsecond // 1000:03d}"
+        rand = secrets.token_hex(4)
+        return f"{ts}#{rand}"
+
+    def _get_or_create_client_id(self) -> str:
+        """
+        获取或生成 clientId。
+
+        抓包中 clientId 为 Base64 编码的长整数 (如: NzM1MTMxOTc1OTI1MTc0Mjcy = 735131975925174272)。
+        这里用 userId 的 Base64 编码作为替代，实际效果等价。
+        """
+        if hasattr(self, "_client_id"):
+            return self._client_id
+
+        user_info = self._get_user_info()
+        user_id = user_info.get("userId", str(uuid.uuid4().int >> 96))
+        # 用 userId 数值做 base64
+        self._client_id = b64encode(user_id.encode()).decode()
+        return self._client_id
 
     def get_place_id(self, court_type: str) -> str:
         for name, pid in self.PLACE_MAP.items():
