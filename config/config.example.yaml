@@ -22,24 +22,29 @@ auth:
   password: "${COURT_BOT_PASSWORD}"     # Use env var for security
   login_type: auto                      # auto | wechat | cas | direct | token
 
-  # Advanced: if you already have a token, paste it here to skip login
+  # Token auto-management: login once → auto-refresh → long-lived
+  # After first login, token + refresh_token are saved automatically.
   token: ""
+  refresh_token: ""
+  token_expiration: ""
 
-  # Advanced: WeChat-specific (only if login_type=wechat)
+  # One-time: capture wechat_code from WeChat mini program login
   wechat_code: ""
 
 # ── Booking Preferences ───────────────────────────────────
 booking:
   court_type: "羽毛球"                   # Court type name (as shown in system)
-  date_offset: 1                        # Book N days ahead
-  preferred_times:                      # Time slots by priority
-    - "09:00-10:00"
-    - "10:00-11:00"
-    - "11:00-12:00"
+  date_offset: 1                        # Book N days ahead (used if target_day_of_week is empty)
+  target_day_of_week: "星期五"           # e.g. "Friday", "星期五" — which day to book
+  preferred_times:                      # First time slot (consecutive follow-ups auto-added)
+    - "18:30-19:30"
   preferred_courts:                     # Court numbers by priority (1-based)
-    - 1
-    - 2
-    - 3
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+  consecutive_slots: 2                  # Book N consecutive slots on same court (2 = 2 hours)
   fallback_to_any: true                 # If preferred slots taken, try any available
   max_candidates: 20                    # Max candidates to try
 
@@ -49,6 +54,8 @@ schedule:
   pre_fetch_seconds: 5                  # Seconds before opening to load data
   fire_early_ms: 80                     # Fire this many ms early (network latency compensation)
   timezone: "Asia/Shanghai"
+  run_day: "星期四"                      # Day to auto-run (for scheduled task reference)
+  run_time: "07:00"                     # Time to auto-run (for scheduled task reference)
 
 # ── Notifications ─────────────────────────────────────────
 # Configure at least one channel to receive booking results.

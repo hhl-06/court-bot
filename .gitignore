@@ -65,3 +65,5 @@ proxy_out.txt
 start_dump.py
 start_proxy.py
 capture_setup.bat
+scripts/capture_authcode.py
+setup_scheduled_task.ps1

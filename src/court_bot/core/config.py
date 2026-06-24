@@ -25,6 +25,8 @@ class AuthConfig(BaseModel):
     password: str = ""
     login_type: str = "auto"  # auto, wechat, cas, direct, token
     token: str = ""           # pre-obtained token (bypass login)
+    refresh_token: str = ""   # refresh token (extends token lifetime)
+    token_expiration: str = ""# token expiration time "YYYY-MM-DD HH:MM:SS"
     wechat_code: str = ""     # wx.login() code for WeChat OAuth
     auth_url: str = ""        # custom login endpoint
     refresh_url: str = ""     # token refresh endpoint
@@ -35,8 +37,10 @@ class BookingConfig(BaseModel):
     """Booking preferences."""
     court_type: str = ""
     date_offset: int = 1
+    target_day_of_week: str = ""  # e.g. "Friday", "星期五" — overrides date_offset
     preferred_times: list[str] = Field(default_factory=list)
     preferred_courts: list[int] = Field(default_factory=list)
+    consecutive_slots: int = 1  # book N consecutive slots on the same court
     fallback_to_any: bool = True
     max_candidates: int = 20
 
@@ -140,16 +144,20 @@ auth:
   student_id: "2021001234"
   password: "${COURT_BOT_PASSWORD}"
   login_type: auto
+  token: ""
+  refresh_token: ""
+  token_expiration: ""
+  wechat_code: ""
 
 # ── Booking Preferences ───────────────────────────────────
 booking:
   court_type: "羽毛球"
   date_offset: 1
+  target_day_of_week: "星期五"
   preferred_times:
-    - "09:00-10:00"
-    - "10:00-11:00"
-    - "11:00-12:00"
-  preferred_courts: [1, 2, 3]
+    - "18:30-19:30"
+  preferred_courts: [6, 7, 8, 9, 10]
+  consecutive_slots: 2
   fallback_to_any: true
 
 # ── Schedule ──────────────────────────────────────────────
@@ -158,6 +166,8 @@ schedule:
   pre_fetch_seconds: 5
   fire_early_ms: 80
   timezone: "Asia/Shanghai"
+  run_day: "星期四"
+  run_time: "07:00"
 
 # ── Notifications ─────────────────────────────────────────
 # At least one channel recommended.

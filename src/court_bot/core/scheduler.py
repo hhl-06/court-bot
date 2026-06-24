@@ -101,11 +101,17 @@ class BookingScheduler:
         # 6. Fire booking requests
         logger.info("🚀 FIRING booking requests at %s", self.time_sync.now_formatted)
 
+        consecutive = max(1, self.config.booking.consecutive_slots)
+
         if self.config.advanced.dry_run:
-            logger.info("[DRY RUN] Would book: %s", candidates[0])
+            slots_desc = candidates[0].slot_label
+            if consecutive > 1:
+                follow = self._get_consecutive_slots(candidates[0])
+                slots_desc = " + ".join(s.slot_label for s in [candidates[0]] + follow[:consecutive-1])
+            logger.info("[DRY RUN] Would book: %s | %s (x%d)", candidates[0].court_name, slots_desc, consecutive)
             return BookingResult(success=True, booking_id="DRY_RUN",
                                  court_name=candidates[0].court_name,
-                                 slot_label=candidates[0].slot_label)
+                                 slot_label=slots_desc)
 
         result = self._try_candidates(candidates, target_date)
 
@@ -185,7 +191,41 @@ class BookingScheduler:
 
     # ── internals ─────────────────────────────────────────
 
+    # Day-of-week mapping: supports English & Chinese
+    _DAY_MAP: dict[str, int] = {
+        "monday": 0, "mon": 0, "星期一": 0, "周一": 0,
+        "tuesday": 1, "tue": 1, "星期二": 1, "周二": 1,
+        "wednesday": 2, "wed": 2, "星期三": 2, "周三": 2,
+        "thursday": 3, "thu": 3, "星期四": 3, "周四": 3,
+        "friday": 4, "fri": 4, "星期五": 4, "周五": 4,
+        "saturday": 5, "sat": 5, "星期六": 5, "周六": 5,
+        "sunday": 6, "sun": 6, "星期日": 6, "周日": 6, "星期天": 6,
+    }
+
     def _target_date(self) -> str:
+        """Calculate the target booking date.
+
+        Priority:
+        1. target_day_of_week (e.g. "Friday") — next occurrence
+        2. date_offset (e.g. 1 = tomorrow)
+        """
+        day_of_week = self.config.booking.target_day_of_week.strip().lower()
+        if day_of_week and day_of_week in self._DAY_MAP:
+            target_dow = self._DAY_MAP[day_of_week]
+            today = datetime.now()
+            today_dow = today.weekday()  # Monday=0, Sunday=6
+            days_ahead = target_dow - today_dow
+            if days_ahead <= 0:
+                days_ahead += 7
+            target = today + timedelta(days=days_ahead)
+            logger.info(
+                "Target: next %s (%s), %d day(s) from now",
+                self.config.booking.target_day_of_week,
+                target.strftime("%Y-%m-%d"),
+                days_ahead,
+            )
+            return target.strftime("%Y-%m-%d")
+
         offset = self.config.booking.date_offset
         target = datetime.now() + timedelta(days=offset)
         return target.strftime("%Y-%m-%d")
@@ -212,18 +252,72 @@ class BookingScheduler:
                         wait, self.config.schedule.fire_early_ms)
             self.time_sync.precise_sleep(wait)
 
+    def _get_consecutive_slots(self, candidate, count: int = 1):
+        """
+        Find consecutive follow-up slots on the same court.
+
+        Given a candidate (e.g., 18:30-19:30 on Court 6),
+        find the next available slot(s) (e.g., 19:30-20:30 on Court 6).
+
+        Uses time arithmetic: next slot starts when current slot ends.
+        """
+        # Parse candidate's end time as minutes
+        end_h, end_m = candidate.end_time.split(":")
+        next_start_min = int(end_h) * 60 + int(end_m)
+
+        results = []
+        current_start_min = next_start_min
+
+        for _ in range(count):
+            next_start = f"{current_start_min // 60:02d}:{current_start_min % 60:02d}"
+            next_end_min = current_start_min + 60  # NJUCM slots are 60 min each
+            next_end = f"{next_end_min // 60:02d}:{next_end_min % 60:02d}"
+
+            # Build a matching candidate
+            from court_bot.platforms.base import Candidate
+            fs = Candidate(
+                court_id=candidate.court_id,
+                court_name=candidate.court_name,
+                court_number=candidate.court_number,
+                slot_id=f"{candidate.raw_slot.get('area_id', '')}_{next_start}_{next_end}",
+                slot_label=f"{next_start}-{next_end}",
+                start_time=next_start,
+                end_time=next_end,
+                raw_court=dict(candidate.raw_court),
+                raw_slot={**candidate.raw_slot, "start_time": next_start, "end_time": next_end},
+            )
+            results.append(fs)
+            current_start_min = next_end_min
+
+        return results
+
     def _try_candidates(
         self,
         candidates: list,
         target_date: str,
     ) -> BookingResult | None:
-        """Try each candidate in priority order, retrying on failure."""
+        """Try each candidate in priority order, retrying on failure.
+
+        When consecutive_slots > 1, also books follow-up slots on the same court.
+        """
         retries = self.config.advanced.retry_count
         interval = self.config.advanced.retry_interval
+        consecutive = max(1, self.config.booking.consecutive_slots)
 
         for i, candidate in enumerate(candidates):
             logger.info("Candidate %d/%d: %s | %s", i + 1, len(candidates),
                         candidate.court_name, candidate.slot_label)
+
+            # Skip candidates that don't have enough consecutive slots available
+            if consecutive > 1:
+                follow_slots = self._get_consecutive_slots(candidate, count=consecutive - 1)
+                if len(follow_slots) < consecutive - 1:
+                    logger.info("  Skipped: need %d consecutive slots, only %d follow-ups available",
+                                consecutive, len(follow_slots))
+                    continue
+                logger.info("  + %d consecutive follow-up(s): %s",
+                            len(follow_slots),
+                            ", ".join(s.slot_label for s in follow_slots))
 
             for attempt in range(retries):
                 if attempt > 0:
@@ -232,10 +326,38 @@ class BookingScheduler:
 
                 result = self.platform.book(candidate, target_date)
 
-                if result.success:
-                    return result
+                if not result.success:
+                    logger.warning("  Failed: %s", result.message or "(no message)")
+                    continue
 
-                logger.warning("  Failed: %s", result.message or "(no message)")
+                # Book consecutive follow-up slots
+                booked_ids = [result.booking_id]
+                booked_labels = [candidate.slot_label]
+                follow_results = []
+
+                for fs in follow_slots[:consecutive - 1]:
+                    logger.info("  Booking follow-up: %s", fs.slot_label)
+                    fr = self.platform.book(fs, target_date)
+                    if fr.success:
+                        booked_ids.append(fr.booking_id)
+                        booked_labels.append(fs.slot_label)
+                        follow_results.append(fr)
+                        logger.info("  Follow-up booked: %s | %s", fs.slot_label, fr.booking_id)
+                    else:
+                        logger.warning("  Follow-up failed: %s — partial booking!", fr.message)
+                        result = BookingResult(
+                            success=True,
+                            booking_id=", ".join(booked_ids),
+                            message=f"部分成功: {', '.join(booked_labels)} (后续时段失败: {fr.message})",
+                            court_name=candidate.court_name,
+                            slot_label=" + ".join(booked_labels),
+                        )
+                        return result
+
+                # All slots booked successfully
+                result.booking_id = ", ".join(booked_ids)
+                result.slot_label = " + ".join(booked_labels)
+                return result
 
             logger.info("  Exhausted retries for this candidate")
 

@@ -99,18 +99,72 @@ class NJUCMPlatform(BasePlatform):
 
     def authenticate(self) -> bool:
         auth_cfg = self.config.auth
+
+        # 1. Pre-obtained token (fastest path)
         if auth_cfg.token:
             self._token = auth_cfg.token
+            self._refresh_token = auth_cfg.refresh_token
+            self._token_expiration = auth_cfg.token_expiration
             self._set_auth_header()
             self._authenticated = True
             self._check_token_expiry()
             return True
 
+        # 2. Try refresh token (avoids re-login)
+        if auth_cfg.refresh_token:
+            if self._try_refresh_token(auth_cfg.refresh_token):
+                return True
+            logger.info("refresh token 失败，尝试 wechat_code 登录...")
+
+        # 3. WeChat code login
         wx_code = auth_cfg.wechat_code
         if not wx_code:
-            logger.error("需要 token 或 wechat_code。在 config.auth 中配置。")
+            logger.error("需要 token、refresh_token 或 wechat_code。在 config.auth 中配置。")
             return False
         return self._login_with_code(wx_code)
+
+    def _try_refresh_token(self, refresh_token: str) -> bool:
+        """
+        尝试用 refresh_token 刷新 access_token。
+
+        支持两种端点 (自动尝试):
+          1. /authserver/token/refresh  (OAuth2 标准)
+          2. /authserver/wx/refresh     (微信常见)
+        """
+        endpoints = [
+            "/authserver/token/refresh",
+            "/authserver/wx/refresh",
+        ]
+        # 如果有自定义 refresh_url，优先使用
+        if self.config.auth.refresh_url:
+            endpoints.insert(0, self.config.auth.refresh_url)
+
+        for ep in endpoints:
+            try:
+                resp = self.session.post(
+                    ep,
+                    json={"refreshToken": refresh_token},
+                )
+                if not resp:
+                    continue
+                data = resp.json()
+                if data.get("success"):
+                    token_data = data.get("data", data)
+                    self._token = token_data.get("accessToken", "")
+                    new_refresh = token_data.get("refreshToken", refresh_token)
+                    self._token_expiration = token_data.get("expiration", "")
+                    self._set_auth_header()
+                    self._authenticated = True
+                    # 更新 config 中的值，便于下次启动使用
+                    self.config.auth.token = self._token
+                    self.config.auth.refresh_token = new_refresh
+                    self.config.auth.token_expiration = self._token_expiration
+                    logger.info("Token 刷新成功 (via %s), 有效期至 %s", ep, self._token_expiration)
+                    return True
+            except Exception as e:
+                logger.debug("刷新端点 %s 失败: %s", ep, e)
+
+        return False
 
     def _check_token_expiry(self) -> None:
         """检测 token 是否即将过期 (< 6h)，通过通知提醒。"""
@@ -154,6 +208,10 @@ class NJUCMPlatform(BasePlatform):
         self._token_expiration = data["data"].get("expiration", "")
         self._set_auth_header()
         self._authenticated = True
+        # 存回 config，下次启动直接用 refresh_token 续期
+        self.config.auth.token = self._token
+        self.config.auth.refresh_token = self._refresh_token
+        self.config.auth.token_expiration = self._token_expiration
         logger.info("登录成功, 有效期至 %s (refreshToken: %s...)",
                     self._token_expiration, self._refresh_token[:12] if self._refresh_token else "无")
         return True
