@@ -72,13 +72,13 @@ class BookingScheduler:
         target_date = self._target_date()
         logger.info("Target date: %s", target_date)
 
-        # 4. Wait for the right moment
+        # 4. Wait for the pre-fetch moment (only in timed mode)
         if not fire_immediately:
-            self._wait_until_opening()
+            self._wait_until_prefetch()
         else:
             logger.info("Immediate mode — skipping countdown")
 
-        # 5. Pre-fetch available slots
+        # 5. Pre-fetch available slots (before booking opens → slots don't change)
         logger.info("Fetching available slots...")
         candidates = self.platform.find_candidates(
             date=target_date,
@@ -97,6 +97,15 @@ class BookingScheduler:
         logger.info("Found %d candidate(s):", len(candidates))
         for i, c in enumerate(candidates[:10]):
             logger.info("  %2d. %s | %s", i + 1, c.court_name, c.slot_label)
+
+        # 5.5. Pre-warm the booking pipeline (user info + goodsId) so the
+        #      create request fires the instant the opening moment arrives.
+        if not fire_immediately:
+            self._prewarm(candidates, target_date)
+
+        # 5.6. Wait for the exact fire moment
+        if not fire_immediately:
+            self._wait_until_fire()
 
         # 6. Fire booking requests
         logger.info("🚀 FIRING booking requests at %s", self.time_sync.now_formatted)
@@ -230,13 +239,11 @@ class BookingScheduler:
         target = datetime.now() + timedelta(days=offset)
         return target.strftime("%Y-%m-%d")
 
-    def _wait_until_opening(self) -> None:
-        """Sleep until (open_time - pre_fetch_seconds), then pre-fetch, then fire."""
+    def _wait_until_prefetch(self) -> None:
+        """Sleep until the pre-fetch moment (open_time - pre_fetch_seconds)."""
         open_time = self.config.schedule.open_time
         pre_fetch = self.config.schedule.pre_fetch_seconds
-        fire_early = self.config.schedule.fire_early_ms / 1000.0
 
-        # Phase 1: wait until pre-fetch moment
         wait = self.time_sync.time_until(open_time) - pre_fetch
         if wait > 0:
             logger.info(
@@ -245,12 +252,29 @@ class BookingScheduler:
             )
             self.time_sync.precise_sleep(wait)
 
-        # Phase 2: wait until fire moment (with early-offset)
+    def _wait_until_fire(self) -> None:
+        """Sleep until the fire moment (open_time - fire_early_ms)."""
+        open_time = self.config.schedule.open_time
+        fire_early = self.config.schedule.fire_early_ms / 1000.0
+
         wait = max(0, self.time_sync.time_until(open_time) - fire_early)
         if wait > 0:
             logger.info("Waiting %.3fs until fire time (early offset %dms)...",
                         wait, self.config.schedule.fire_early_ms)
             self.time_sync.precise_sleep(wait)
+
+    def _prewarm(self, candidates: list, target_date: str) -> None:
+        """Pre-warm platform caches (user info, goodsId, ...) for the top candidates.
+
+        This guarantees the booking request itself goes out the instant the
+        fire moment arrives, with no extra network round-trips in the way.
+        """
+        prewarm = getattr(self.platform, "prewarm", None)
+        if callable(prewarm):
+            try:
+                prewarm(candidates[:5], target_date)
+            except Exception as e:
+                logger.debug("Pre-warm failed (non-fatal): %s", e)
 
     def _get_consecutive_slots(self, candidate, count: int = 1):
         """

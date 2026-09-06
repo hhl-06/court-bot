@@ -43,10 +43,10 @@ def response(flow):
     if CONFIG_PATH.exists():
         content = CONFIG_PATH.read_text(encoding="utf-8")
         for old_val, new_val in [
-            (r'wechat_code:\s*"[^"]*"', f'wechat_code: "{auth_code}"'),
-            (r'token:\s*"[^"]*"', f'token: "{access_token}"'),
-            (r'refresh_token:\s*"[^"]*"', f'refresh_token: "{refresh_token}"'),
-            (r'token_expiration:\s*"[^"]*"', f'token_expiration: "{expiration}"'),
+            (r'\bwechat_code:\s*"[^"]*"', f'wechat_code: "{auth_code}"'),
+            (r'\btoken:\s*"[^"]*"', f'token: "{access_token}"'),
+            (r'\brefresh_token:\s*"[^"]*"', f'refresh_token: "{refresh_token}"'),
+            (r'\btoken_expiration:\s*"[^"]*"', f'token_expiration: "{expiration}"'),
         ]:
             content = re.sub(old_val, new_val, content)
         CONFIG_PATH.write_text(content, encoding="utf-8")

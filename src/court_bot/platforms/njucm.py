@@ -93,15 +93,21 @@ class NJUCMPlatform(BasePlatform):
             "Referer": f"https://servicewechat.com/{self.APP_ID}/23/page-frame.html",
         })
         self._token: str = ""
+        self._config_path: str = getattr(config, "_config_path", "")
         self._area_cache: dict[str, dict] = {}  # area_id → {name, rules}
+        self._goods_id_cache: dict[tuple, str] = {}  # (place, area, start, end, date) → goodsId
+        # placeAreaId → 场地号（精确反查，避免 "15号" 误匹配 "5号"）
+        self._area_id_to_num: dict[str, int] = {v: k for k, v in self.AREA_NAME_MAP.items()}
 
     # ── Authentication ───────────────────────────────────
 
     def authenticate(self) -> bool:
         auth_cfg = self.config.auth
 
-        # 1. Pre-obtained token (fastest path)
-        if auth_cfg.token:
+        # 1. Valid pre-obtained token (fastest path, no network round-trip)
+        if auth_cfg.token and not (
+            auth_cfg.token_expiration and self._is_expired(auth_cfg.token_expiration)
+        ):
             self._token = auth_cfg.token
             self._refresh_token = auth_cfg.refresh_token
             self._token_expiration = auth_cfg.token_expiration
@@ -110,7 +116,7 @@ class NJUCMPlatform(BasePlatform):
             self._check_token_expiry()
             return True
 
-        # 2. Try refresh token (avoids re-login)
+        # 2. Token expired/missing → try refresh (auto-heal, avoids re-login)
         if auth_cfg.refresh_token:
             if self._try_refresh_token(auth_cfg.refresh_token):
                 return True
@@ -159,6 +165,7 @@ class NJUCMPlatform(BasePlatform):
                     self.config.auth.token = self._token
                     self.config.auth.refresh_token = new_refresh
                     self.config.auth.token_expiration = self._token_expiration
+                    self._save_auth()
                     logger.info("Token 刷新成功 (via %s), 有效期至 %s", ep, self._token_expiration)
                     return True
             except Exception as e:
@@ -212,12 +219,48 @@ class NJUCMPlatform(BasePlatform):
         self.config.auth.token = self._token
         self.config.auth.refresh_token = self._refresh_token
         self.config.auth.token_expiration = self._token_expiration
+        self._save_auth()
         logger.info("登录成功, 有效期至 %s (refreshToken: %s...)",
                     self._token_expiration, self._refresh_token[:12] if self._refresh_token else "无")
         return True
 
     def _set_auth_header(self) -> None:
         self.session.headers["Authorization"] = f"Bearer {self._token}"
+
+    @staticmethod
+    def _is_expired(expiration: str) -> bool:
+        """Return True if the 'YYYY-MM-DD HH:MM:SS' timestamp is already in the past."""
+        if not expiration:
+            return False
+        try:
+            return datetime.strptime(expiration, "%Y-%m-%d %H:%M:%S") < datetime.now()
+        except Exception:
+            return False
+
+    def _save_auth(self) -> None:
+        """Persist refreshed token/refresh_token/expiration back to config.yaml."""
+        if not self._config_path:
+            return
+        from pathlib import Path
+        import re
+        p = Path(self._config_path)
+        if not p.exists():
+            return
+        try:
+            content = p.read_text(encoding="utf-8")
+            pairs = []
+            if self._token:
+                pairs.append((r'\btoken:\s*"[^"]*"', f'token: "{self._token}"'))
+            if self._refresh_token:
+                pairs.append((r'\brefresh_token:\s*"[^"]*"', f'refresh_token: "{self._refresh_token}"'))
+            if self._token_expiration:
+                pairs.append((r'\btoken_expiration:\s*"[^"]*"', f'token_expiration: "{self._token_expiration}"'))
+            for old_val, new_val in pairs:
+                content = re.sub(old_val, new_val, content)
+            p.write_text(content, encoding="utf-8")
+            logger.info("已持久化新 token 到 config.yaml")
+        except Exception as e:
+            logger.warning("持久化 token 失败: %s", e)
 
     # ── Court / Slot Fetching ────────────────────────────
 
@@ -598,22 +641,80 @@ class NJUCMPlatform(BasePlatform):
             logger.warning("没有可用时段")
             return []
 
-        # 构建候选并排序
-        scored: list[tuple[int, int, Candidate]] = []
+        # 只在指定时段窗口内回退（如 18:30-21:30），空=不限
+        time_window = (getattr(self.config.booking, "time_window", "") or "").strip()
+        if time_window:
+            win_start, sep, win_end = time_window.partition("-")
+            if sep and win_start and win_end:
+                wmin = self._hhmm_to_min(win_start)
+                wmax = self._hhmm_to_min(win_end)
+                available = [
+                    s for s in available
+                    if self._hhmm_to_min(s.start_time) >= wmin
+                    and self._hhmm_to_min(s.end_time) <= wmax
+                ]
+                if not available:
+                    logger.warning("时段窗口 %s 内无可用时段", time_window)
+                    return []
+
+        # 连约段数（同一场地连约 N 段 = N 小时）
+        consecutive = max(1, int(getattr(self.config.booking, "consecutive_slots", 1) or 1))
+
+        # 可用时段集合，用于校验连约时段是否在同一场地连续可用
+        avail_set = {(s.extra.get("area_id", ""), s.label) for s in available}
+
+        # 场地扩散中心：偏好场地的第一块即全场"中间"（如 8）
+        center = preferred_courts[0] if preferred_courts else 8
+
+        # 两侧非偏好场地各自的中心：1~5 以 3 为中心、11~15 以 13 为中心
+        all_nums = sorted(self.AREA_NAME_MAP.keys())
+        left_nums = [n for n in all_nums if n < center and n not in preferred_courts]
+        right_nums = [n for n in all_nums if n > center and n not in preferred_courts]
+        left_center = left_nums[len(left_nums) // 2] if left_nums else center
+        right_center = right_nums[len(right_nums) // 2] if right_nums else center
+
+        # 构建候选并排序（时间优先 → 连约完整 → 场地偏好）
+        scored: list[tuple[int, int, int, Candidate]] = []
         for slot in available:
             area_id = slot.extra.get("area_id", "")
             area_name = slot.extra.get("area_name", "")
 
-            # 从场地名提取编号 (如 "1号场地" → 1)
-            area_num = 0
-            for i in range(1, 16):
-                if f"{i}号" in area_name:
-                    area_num = i
-                    break
+            # 场地编号：优先用 area_id 精确反查；兜底从场地名倒序解析
+            area_num = self._area_id_to_num.get(area_id, 0)
+            if area_num == 0:
+                for i in range(15, 0, -1):
+                    if f"{i}号" in area_name:
+                        area_num = i
+                        break
 
-            # 计算偏好排名
-            court_rank = preferred_courts.index(area_num) if area_num in preferred_courts else len(preferred_courts)
+            # 场地排名：偏好场地按用户顺序；其余在各自侧组内"中间向两边"扩散
+            if area_num in preferred_courts:
+                court_rank = preferred_courts.index(area_num)
+            else:
+                if area_num < center:
+                    d = abs(area_num - left_center)
+                    side = 0
+                    within = 0 if area_num <= left_center else 1
+                else:
+                    d = abs(area_num - right_center)
+                    side = 1
+                    within = 0 if area_num <= right_center else 1
+                court_rank = len(preferred_courts) + d * 4 + side * 2 + within
             time_rank = self._match_time_preference(slot.label, preferred_times)
+
+            # 连约完整性：后面 consecutive-1 段是否也在同一场地可用
+            consec_rank = 0
+            if consecutive > 1:
+                cur_start, cur_end = slot.start_time, slot.end_time
+                ok = True
+                for _ in range(consecutive - 1):
+                    nxt = self._next_slot_label(cur_start, cur_end)
+                    if (area_id, nxt) not in avail_set:
+                        ok = False
+                        break
+                    cur_start, cur_end = nxt.split("-")
+                if not ok:
+                    consec_rank = 1
 
             c = Candidate(
                 court_id=place_id,
@@ -626,20 +727,26 @@ class NJUCMPlatform(BasePlatform):
                 raw_court={"place_id": place_id, "area_id": area_id, "area_name": area_name},
                 raw_slot={"area_id": area_id, **slot.extra},
             )
-            scored.append((court_rank, time_rank, c))
+            scored.append((time_rank, consec_rank, court_rank, c))
 
-        scored.sort(key=lambda x: (x[0], x[1]))
+        scored.sort(key=lambda x: (x[0], x[1], x[2]))
 
         if not fallback_to_any:
-            scored = [(cr, tr, c) for cr, tr, c in scored
+            scored = [(tr, consec_rank, cr, c) for tr, consec_rank, cr, c in scored
                       if cr < len(preferred_courts) and tr < len(preferred_times)]
 
-        candidates = [c for _, _, c in scored[:max_candidates]]
+        candidates = [c for _, _, _, c in scored[:max_candidates]]
         logger.info("找到 %d 个候选 (%s)", len(candidates), date)
         for i, c in enumerate(candidates[:8]):
             logger.info("  候选 %d: %s %s", i + 1, c.court_name, c.slot_label)
 
         return candidates
+
+    @staticmethod
+    def _hhmm_to_min(t: str) -> int:
+        """把 "HH:MM" 转成分钟数，用于时段窗口比较。"""
+        h, m = t.split(":")
+        return int(h) * 60 + int(m)
 
     @staticmethod
     def _match_time_preference(slot_label: str, preferred: list[str]) -> int:
@@ -674,6 +781,19 @@ class NJUCMPlatform(BasePlatform):
 
         return len(preferred)
 
+    @staticmethod
+    def _next_slot_label(start_time: str, end_time: str) -> str:
+        """给定一个时段，返回紧接着的下一个同时长时段标签 (如 18:30-19:30 → 19:30-20:30)。"""
+        def _min(t: str) -> int:
+            h, m = t.split(":")
+            return int(h) * 60 + int(m)
+
+        s = _min(start_time)
+        e = _min(end_time)
+        dur = e - s
+        ns, ne = e, e + dur
+        return f"{ns // 60:02d}:{ns % 60:02d}-{ne // 60:02d}:{ne % 60:02d}"
+
     # ── Utilities ────────────────────────────────────────
 
     def _get_user_info(self) -> dict[str, Any]:
@@ -703,6 +823,11 @@ class NJUCMPlatform(BasePlatform):
 
         根据抓包分析，goodsId = placeAreaPriceId，通过 week 和时段匹配。
         """
+        # 缓存命中（预热时已查过）
+        key = (place_id, area_id, start_time, end_time, date)
+        if key in self._goods_id_cache:
+            return self._goods_id_cache[key]
+
         # 计算星期几 (01=周日, 02=周一, ..., 07=周六)
         # NJUCM 系统: 周日=01, ISO 周日=7
         dt = datetime.strptime(date, "%Y-%m-%d")
@@ -731,6 +856,8 @@ class NJUCMPlatform(BasePlatform):
                 for t in area.get("times", []):
                     if t.get("startTime") == start_time and t.get("endTime") == end_time:
                         goods_id = t.get("placeAreaPriceId", "")
+                        if goods_id:
+                            self._goods_id_cache[key] = goods_id
                         logger.info("找到 goodsId=%s (%s %s-%s week=%s)",
                                     goods_id, area.get("placeAreaName"),
                                     start_time, end_time, week)
@@ -767,6 +894,20 @@ class NJUCMPlatform(BasePlatform):
         self._client_id = b64encode(user_id.encode()).decode()
         return self._client_id
 
+    def prewarm(self, candidates: list[Candidate], date: str) -> None:
+        """预热下单管道：提前缓存用户信息 + 顶部候选的 goodsId。
+
+        这样到达开抢时刻时，submit_booking 无需再发额外网络请求，
+        create 请求立刻发出（抢到整点的关键）。
+        """
+        # 预热用户信息缓存（顺带验证 token 仍有效）
+        self._get_user_info()
+        for c in candidates:
+            area_id = c.raw_slot.get("area_id", "") or c.raw_court.get("area_id", "")
+            if area_id and c.court_id:
+                self._get_goods_id(c.court_id, area_id, c.start_time, c.end_time, date)
+        logger.info("预热完成: 已缓存 %d 个候选的 goodsId", len(candidates))
+
     def get_place_id(self, court_type: str) -> str:
         for name, pid in self.PLACE_MAP.items():
             if court_type in name or name in court_type:
@@ -775,8 +916,95 @@ class NJUCMPlatform(BasePlatform):
         return courts[0].court_id if courts else ""
 
     def get_my_bookings(self) -> list[dict]:
-        resp = self.session.get("/order/user-info/detail")
-        return [resp.json()] if resp and resp.status_code == 200 else []
+        """获取我的订单列表（已支付/待使用，即可取消的）。"""
+        user = self._get_user_info()
+        user_id = user.get("userId", "")
+        if not user_id:
+            return []
+        resp = self.session.post("/order/order/orderPage", json={
+            "pageIndex": 1,
+            "pageSize": 50,
+            "mpOrderStatus": "02",
+            "userId": user_id,
+        })
+        if not resp:
+            return []
+        data = resp.json()
+        if not data.get("success"):
+            return []
+        return data.get("data", {}).get("data", []) or []
+
+    def cancel_booking(self, booking_id: str) -> bool:
+        """
+        取消预约 — 从小程序抓包还原的真实退款流程:
+
+        ① GET  /order/order/orderDetail/{businessOrderNo}
+                 → 取 businessSubOrderNo + placeAreaReserveDetailIds + 预约日期
+        ② GET  /order/refund-rule-config/getRefundMoneyBySubOrderNo?subOrderNo=...
+                 → 取退款金额 (免费场地为 0)
+        ③ POST /order/place/ticket/updateOrderReserveCancel → 真正取消+退款
+        """
+        # ── ① 订单详情 ──
+        resp = self.session.get(f"/order/order/orderDetail/{booking_id}")
+        if not resp or resp.status_code != 200:
+            logger.error("① 取消失败: 订单详情请求失败")
+            return False
+        detail = resp.json()
+        if not detail.get("success"):
+            logger.error("① 取消失败: %s", detail.get("errMessage"))
+            return False
+        detail_data = detail.get("data", {})
+        sub_list = detail_data.get("orderDetailList") or []
+        if not sub_list:
+            logger.error("取消失败: 订单无子订单")
+            return False
+        sub = sub_list[0]
+        sub_order_no = sub.get("businessSubOrderNo", "")
+        reserve_ids = sub.get("placeAreaReserveDetailIds") or []
+        remark = sub.get("remark") or {}
+        date = remark.get("date", "")
+        if not sub_order_no or not reserve_ids or not date:
+            logger.error("取消失败: 缺少 subOrderNo/reserveIds/date")
+            return False
+
+        # ── ② 退款金额 ──
+        money = 0
+        resp2 = self.session.get(
+            "/order/refund-rule-config/getRefundMoneyBySubOrderNo",
+            params={"subOrderNo": sub_order_no},
+        )
+        if resp2 and resp2.status_code == 200:
+            d2 = resp2.json()
+            if d2.get("success"):
+                try:
+                    money = int(float(d2.get("data", 0) or 0))
+                except (TypeError, ValueError):
+                    money = 0
+
+        # ── ③ 取消 ──
+        payload = {
+            "businessOrderNo": booking_id,
+            "cancelType": "01",
+            "date": date,
+            "money": money,
+            "placeAreaReserveDetailIds": reserve_ids,
+            "refundReason": "时间冲突",
+        }
+        resp3 = self.session.post(
+            "/order/place/ticket/updateOrderReserveCancel", json=payload
+        )
+        if not resp3 or resp3.status_code != 200:
+            logger.error("③ 取消失败: 请求失败")
+            return False
+        d3 = resp3.json()
+        if d3.get("success"):
+            logger.info("已取消预约: %s | %s %s",
+                        booking_id,
+                        detail_data.get("placeName", ""),
+                        remark.get("times", ""))
+            return True
+        logger.error("③ 取消失败: %s", d3.get("errMessage"))
+        return False
 
     def close(self) -> None:
         self.session.close()

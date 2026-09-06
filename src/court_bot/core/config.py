@@ -43,6 +43,7 @@ class BookingConfig(BaseModel):
     consecutive_slots: int = 1  # book N consecutive slots on the same court
     fallback_to_any: bool = True
     max_candidates: int = 20
+    time_window: str = ""  # 只在此时段内回退，如 "18:30-21:30"；空=不限
 
 
 class ScheduleConfig(BaseModel):
@@ -123,7 +124,11 @@ def load_config(path: str | Path) -> AppConfig:
         raw = yaml.safe_load(f)
 
     raw = _resolve_env_vars(raw)
-    return AppConfig(**raw)
+    config = AppConfig(**raw)
+    # 把源文件路径存到 config 上，供平台适配器把刷新后的 token 持久化回文件。
+    # Pydantic 会拒绝未知字段赋值，所以绕过 __setattr__。
+    object.__setattr__(config, "_config_path", str(path))
+    return config
 
 
 def generate_example_config() -> str:
