@@ -9,10 +9,18 @@ Beautiful CLI powered by Typer + Rich with:
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
 from typing import Optional
+
+# pythonw.exe（无控制台）下 sys.stdout/stderr 为 None，会让后续 Rich / reconfigure 崩溃。
+# 先兜底到 devnull，保证计划任务无头环境也能跑；真正的日志走文件 handler。
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 # Fix encoding for CJK output on Windows
 if sys.platform == "win32":
