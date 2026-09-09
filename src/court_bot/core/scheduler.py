@@ -266,15 +266,24 @@ class BookingScheduler:
     def _prewarm(self, candidates: list, target_date: str) -> None:
         """Pre-warm platform caches (user info, goodsId, ...) for the top candidates.
 
-        This guarantees the booking request itself goes out the instant the
-        fire moment arrives, with no extra network round-trips in the way.
+        Warms both the first hour and the follow-up hour(s) so that every create
+        request — including cross-court fallbacks — can fire the instant the
+        opening moment arrives, with no extra network round-trips in the way.
         """
         prewarm = getattr(self.platform, "prewarm", None)
-        if callable(prewarm):
-            try:
-                prewarm(candidates[:5], target_date)
-            except Exception as e:
-                logger.debug("Pre-warm failed (non-fatal): %s", e)
+        if not callable(prewarm):
+            return
+        consecutive = max(1, self.config.booking.consecutive_slots)
+        warm_list = list(candidates[:6])
+        if consecutive > 1:
+            for c in candidates[:6]:
+                fs = self._shift_candidate(c, 1)
+                if fs is not None:
+                    warm_list.append(fs)
+        try:
+            prewarm(warm_list, target_date)
+        except Exception as e:
+            logger.debug("Pre-warm failed (non-fatal): %s", e)
 
     def _get_consecutive_slots(self, candidate, count: int = 1):
         """
@@ -320,69 +329,103 @@ class BookingScheduler:
         candidates: list,
         target_date: str,
     ) -> BookingResult | None:
-        """Try each candidate in priority order, retrying on failure.
+        """Book the target slots, with per-hour parallel grabbing + cross-court fallback.
 
-        When consecutive_slots > 1, also books follow-up slots on the same court.
+        consecutive_slots == 1:
+            Try candidates in priority order, book the first that succeeds.
+
+        consecutive_slots >= 2:
+            The booking is a "plan" of N hours. Each hour is grabbed independently
+            (in parallel threads) so every create request fires at the opening
+            moment, instead of the 2nd hour waiting for the 1st hour's full
+            payment flow (~6s) to finish. Hour k falls back across courts in the
+            same priority order, so if the best court's follow-up hour is taken,
+            it books that hour on the next-best court.
         """
-        retries = self.config.advanced.retry_count
-        interval = self.config.advanced.retry_interval
         consecutive = max(1, self.config.booking.consecutive_slots)
 
+        if consecutive == 1:
+            return self._book_first_success(candidates, target_date, tag="")
+
+        # hour_lists[k] = k-th hour's options, all sharing the same court order.
+        hour_lists = self._build_hour_lists(candidates, consecutive)
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=consecutive) as ex:
+            futures = [
+                ex.submit(self._book_first_success, hour_lists[k], target_date, f"H{k + 1}")
+                for k in range(consecutive)
+            ]
+            results = [f.result() for f in futures]
+
+        booked = [r for r in results if r.success]
+        if not booked:
+            return BookingResult(success=False, message="All candidates failed")
+
+        ids = [r.booking_id for r in booked]
+        labels = [f"{self._court_short_name(r.court_name)} {r.slot_label}" for r in booked]
+        return BookingResult(
+            success=True,
+            booking_id=", ".join(ids),
+            message="部分成功" if len(booked) < consecutive else "预约成功",
+            court_name=booked[0].court_name,
+            slot_label=" + ".join(labels),
+        )
+
+    def _book_first_success(
+        self,
+        candidates: list,
+        target_date: str,
+        tag: str = "",
+    ) -> BookingResult:
+        """Try candidates in priority order; book and return the first success."""
+        retries = self.config.advanced.retry_count
+        interval = self.config.advanced.retry_interval
+        prefix = f"{tag} " if tag else ""
+
         for i, candidate in enumerate(candidates):
-            logger.info("Candidate %d/%d: %s | %s", i + 1, len(candidates),
+            logger.info("%sCandidate %d/%d: %s | %s", prefix, i + 1, len(candidates),
                         candidate.court_name, candidate.slot_label)
-
-            # Skip candidates that don't have enough consecutive slots available
-            if consecutive > 1:
-                follow_slots = self._get_consecutive_slots(candidate, count=consecutive - 1)
-                if len(follow_slots) < consecutive - 1:
-                    logger.info("  Skipped: need %d consecutive slots, only %d follow-ups available",
-                                consecutive, len(follow_slots))
-                    continue
-                logger.info("  + %d consecutive follow-up(s): %s",
-                            len(follow_slots),
-                            ", ".join(s.slot_label for s in follow_slots))
-
             for attempt in range(retries):
                 if attempt > 0:
-                    logger.info("  Retry %d/%d...", attempt, retries)
+                    logger.info("%sRetry %d/%d...", prefix, attempt, retries)
                     time.sleep(interval)
 
                 result = self.platform.book(candidate, target_date)
-
-                if not result.success:
-                    logger.warning("  Failed: %s", result.message or "(no message)")
-                    continue
-
-                # Book consecutive follow-up slots
-                booked_ids = [result.booking_id]
-                booked_labels = [candidate.slot_label]
-                follow_results = []
-
-                for fs in follow_slots[:consecutive - 1]:
-                    logger.info("  Booking follow-up: %s", fs.slot_label)
-                    fr = self.platform.book(fs, target_date)
-                    if fr.success:
-                        booked_ids.append(fr.booking_id)
-                        booked_labels.append(fs.slot_label)
-                        follow_results.append(fr)
-                        logger.info("  Follow-up booked: %s | %s", fs.slot_label, fr.booking_id)
-                    else:
-                        logger.warning("  Follow-up failed: %s — partial booking!", fr.message)
-                        result = BookingResult(
-                            success=True,
-                            booking_id=", ".join(booked_ids),
-                            message=f"部分成功: {', '.join(booked_labels)} (后续时段失败: {fr.message})",
-                            court_name=candidate.court_name,
-                            slot_label=" + ".join(booked_labels),
-                        )
-                        return result
-
-                # All slots booked successfully
-                result.booking_id = ", ".join(booked_ids)
-                result.slot_label = " + ".join(booked_labels)
-                return result
-
-            logger.info("  Exhausted retries for this candidate")
+                if result.success:
+                    return result
+                logger.warning("%sFailed: %s", prefix, result.message or "(no message)")
+            logger.info("%sExhausted retries for %s", prefix, candidate.court_name)
 
         return BookingResult(success=False, message="All candidates failed")
+
+    def _shift_candidate(self, candidate, k: int):
+        """Return the k-th consecutive slot (k=0 → candidate itself) on the same court."""
+        if k == 0:
+            return candidate
+        follow = self._get_consecutive_slots(candidate, count=k)
+        if len(follow) < k:
+            return None
+        return follow[k - 1]
+
+    def _build_hour_lists(self, candidates: list, consecutive: int) -> list:
+        """Build per-hour option lists, all in the same court priority order.
+
+        hour_lists[k] = [k-th consecutive slot on candidates[0]'s court,
+                         k-th consecutive slot on candidates[1]'s court, ...]
+        """
+        hour_lists = []
+        for k in range(consecutive):
+            hour_lists.append([
+                c for c in (self._shift_candidate(cand, k) for cand in candidates)
+                if c is not None
+            ])
+        return hour_lists
+
+    @staticmethod
+    def _court_short_name(court_name: str) -> str:
+        """Strip the sport prefix from a court name, e.g. '羽毛球 6号场地' → '6号场地'."""
+        for sport in ("羽毛球", "乒乓球"):
+            if court_name.startswith(sport):
+                return court_name[len(sport):].strip()
+        return court_name
